@@ -9,16 +9,27 @@ import random
 import requests
 import re
 import jsons
+import json
+import tempfile
+import unicodedata
+import base64
 import numpy as np
 from bs4 import BeautifulSoup
 import scrapetube
 import sys
+from collections import Counter
+import math
 import yfinance as fn
 from PIL import Image as PilImage
+from PIL.ExifTags import TAGS, GPSTAGS
 from forex_python.converter import CurrencyRates
 from forex_python.bitcoin import BtcConverter
 import time
 import asyncio
+import json  
+import hashlib  
+import pickle  
+from sentence_transformers import SentenceTransformer, util 
 from langchain_community.document_loaders import DirectoryLoader
 from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -55,12 +66,50 @@ intents = discord.Intents.all()
 intents.members = True  # Enables the member update event
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Precomputed tag embeddings for PlutoPhotos
+tag_embeddings_cache = {}
+photo_tags_cache = {}
+
 
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     print('------')
     
+    # Precompute tag embeddings for PlutoPhotos at startup
+    global tag_embeddings_cache, photo_tags_cache, plutoImages, tag_weights, embeddings_cache_path, metadata_cache_path
+    home_dir = os.path.expanduser("~")
+    plutoPhotoPath = os.path.join(home_dir, "PlutoPhotos")
+    jsonPath = os.path.join(plutoPhotoPath, "photoTags.json")
+    embeddings_cache_path = os.path.join(plutoPhotoPath, "tag_embeddings_cache.pkl")
+    metadata_cache_path = os.path.join(plutoPhotoPath, "tag_metadata_cache.pkl")
+
+    # Load images from PlutoPhotos folder
+    plutoImages = [file for file in os.listdir(plutoPhotoPath) if file.endswith(("jpg", "jpeg", "png", "mpo"))]
+
+    if not plutoImages:
+        print("No images found in the PlutoPhotos folder... ")
+        return
+
+    # Load tags from photoTags.json
+    if not os.path.exists(jsonPath):
+        print("The photo tags file (photoTags.json) is missing.")
+        return
+
+    with open(jsonPath, "r") as f:
+        photo_tags_cache = json.load(f)
+
+    # Check if there are any tagged photos
+    if not photo_tags_cache:
+        print("No tagged photos found in photoTags.json.")
+        return
+    
+    # Compute tag weights
+    tag_weights = compute_tag_weights(photo_tags_cache)
+    print(f"Computed weights for {len(tag_weights)} unique tags.")
+
+    # Precompute embeddings in a separate thread, loading from cache if available
+    tag_embeddings_cache = await asyncio.to_thread(precompute_embeddings, plutoImages, photo_tags_cache)
     
     global TxtDoc, SplitInput, AllSplitInput, vectorstore, retriever
     TxtDoc = []  
@@ -93,6 +142,116 @@ async def on_ready():
     except Exception as e:
         print(f"Error: {e}")
         print(f"Something wrong happened in if statement. Try again...")
+    
+    
+def compute_tag_hash(tags):
+    """Compute a hash of the tags to detect changes."""
+    tag_string = " ".join(sorted(tags))  # Sort tags to ensure consistent hashing
+    return hashlib.md5(tag_string.encode('utf-8')).hexdigest()
+
+
+def precompute_embeddings(plutoImages, photo_tags):
+    """Precompute embeddings for new or updated photos and update the cache."""
+    print("Starting precomputation of tag embeddings...")
+    start_time = time.time()
+    embedder = SentenceTransformer('all-MiniLM-L12-v2')
+
+    # Load existing cache and metadata if they exist
+    cached_embeddings = {}
+    cached_metadata = {}
+    if os.path.exists(embeddings_cache_path) and os.path.exists(metadata_cache_path):
+        with open(embeddings_cache_path, 'rb') as f:
+            cached_embeddings = pickle.load(f)
+        with open(metadata_cache_path, 'rb') as f:
+            cached_metadata = pickle.load(f)
+        print(f"Loaded cached embeddings for {len(cached_embeddings)} photos.")
+
+    # Determine which photos need new embeddings (new photos or updated tags)
+    photos_to_process = []
+    new_metadata = {}
+    for idx, (filename, data) in enumerate(photo_tags.items()):
+        if filename not in plutoImages:  # Skip if the photo no longer exists
+            continue
+        tags = data.get("tags", [])
+        tag_hash = compute_tag_hash(tags)
+
+        # Check if the photo is new or its tags have changed
+        if (filename not in cached_embeddings or
+                filename not in cached_metadata or
+                cached_metadata[filename]['tag_hash'] != tag_hash):
+            photos_to_process.append((filename, tags))
+        else:
+            # Use the cached embedding if the tags haven't changed
+            tag_embeddings_cache[filename] = cached_embeddings[filename]
+
+        # Update metadata
+        new_metadata[filename] = {'tag_hash': tag_hash}
+
+        # Log progress every 50 photos to monitor performance
+        if (idx + 1) % 50 == 0:
+            elapsed_time = time.time() - start_time
+            print(f"Checked {idx + 1}/{len(photo_tags)} photos in {elapsed_time:.2f} seconds.")
+
+    # Precompute embeddings for new or updated photos
+    if photos_to_process:
+        print(f"Computing embeddings for {len(photos_to_process)} new or updated photos...")
+        for idx, (filename, tags) in enumerate(photos_to_process):
+            # Join tags into a single string for embedding, giving more weight to location tags
+            weightedTags = tags + [tag for tag in tags if tag in [tags[-2], tags[-1]]] * 3
+            tagSentence = " ".join(weightedTags)
+            # Compute embedding
+            tagEmbedding = embedder.encode(tagSentence, convert_to_tensor=True)
+            tag_embeddings_cache[filename] = tagEmbedding
+
+            # Log progress every 10 photos during computation
+            if (idx + 1) % 10 == 0:
+                elapsed_time = time.time() - start_time
+                print(f"Computed embeddings for {idx + 1}/{len(photos_to_process)} photos in {elapsed_time:.2f} seconds.")
+
+    # Save the updated embeddings and metadata to cache
+    with open(embeddings_cache_path, 'wb') as f:
+        pickle.dump(tag_embeddings_cache, f)
+    with open(metadata_cache_path, 'wb') as f:
+        pickle.dump(new_metadata, f)
+    print(f"Saved embeddings and metadata to cache.")
+
+    elapsed_time = time.time() - start_time
+    print(f"Precomputed embeddings for {len(photos_to_process)} new photos, total {len(tag_embeddings_cache)} photos in {elapsed_time:.2f} seconds.")
+    return tag_embeddings_cache
+ 
+
+def compute_tag_weights(photo_tags_cache):
+    """Compute weights for all tags based on frequency and specificity."""
+    # Count tag occurrences across all photos
+    tag_counts = Counter()
+    total_photos = len(photo_tags_cache)
+    
+    for filename, data in photo_tags_cache.items():
+        tags = data.get("tags", [])
+        tag_counts.update([tag.lower() for tag in tags])
+    
+    # Compute IDF weights: log(total_photos / tag_frequency)
+    tag_weights = {}
+    for tag, count in tag_counts.items():
+        idf = math.log(total_photos / (count + 1))  # +1 to avoid division by zero
+        tag_weights[tag.lower()] = idf
+    
+    # Boost key tags (e.g., names, locations)
+    key_tags = {
+        "jimmy carter": 1.5, "atlanta": 1.5, "georgia": 1.5, "peanut sculpture": 1.5,
+        "sculpture": 1.3, "office": 1.3, "united states": 1.2, "plains": 1.2
+    }
+    for tag, boost in key_tags.items():
+        if tag in tag_weights:
+            tag_weights[tag] *= boost
+    
+    # Normalize weights to a 1.0–3.0 scale
+    min_weight = min(tag_weights.values())
+    max_weight = max(tag_weights.values())
+    for tag in tag_weights:
+        tag_weights[tag] = 1.0 + 2.0 * (tag_weights[tag] - min_weight) / (max_weight - min_weight)
+    
+    return tag_weights
     
     
 
@@ -355,19 +514,9 @@ async def on_member_join(member):
         general_channel = member.guild.get_channel(513111374889746452)
 
         if general_channel and isinstance(general_channel, discord.TextChannel):
+            await general_channel.send(f'Welcome to the Adam Koralik Discord server, {member.mention}!')
 
-                await general_channel.send(f'Welcome to the Adam Koralik Discord server, {member.mention}!')
 
-
-"""
-@bot.command(name='AnnoyDave')
-async def AnnoyDave(ctx):
-
-        annoyance = ctx.guild.get_member(625788407079239681)
-
-        if annoyance:
-                await ctx.send(f'Did you know {annoyance.mention} hates being tagged for no reason?')
-"""
 
 @bot.command(name='Commands', aliases = ["commands", "Command", "command"])
 async def Commands(ctx):
@@ -382,7 +531,6 @@ async def Commands(ctx):
     await ctx.send(commandMsg)
 
 
-
 @bot.command(name = "Davisms", aliases = ["davisms", "pin", "davethoughts", "pinned", "DaveThoughts"])
 async def RandomPinned(ctx):
 
@@ -391,8 +539,7 @@ async def RandomPinned(ctx):
         pinGrabber = await ctx.channel.pins()
 
         for message in pinGrabber:
-                pinArry.append(message.content)
-
+            pinArry.append(message.content)
 
         randomPick = random.randrange(0,len(pinArry))
         
@@ -494,69 +641,184 @@ async def Stocks(ctx):
 
         
 
-@bot.command(name = "Image", aliases = ["image", "IMAGE", "images", "IMAGES"])
+@bot.command(name="Image", aliases=["image", "IMAGE", "images", "IMAGES"])
 async def Image(ctx, *, AskQuestion=None):
-    if AskQuestion is not None:
+    if AskQuestion is None:
+        await ctx.send("No search query was provided. Try asking again...")
+        return
+
+    search_url = "https://www.googleapis.com/customsearch/v1"
+    search_term = AskQuestion
+    
+    # Primary params with num=3 for efficiency (single call)
+    params_primary = {
+        'key': NewGPTKey.GoogleKey,
+        'cx': '4482777d3b53e4801',
+        'searchType': 'image',
+        'q': search_term,
+        'num': 10
+    }
+    
+    # Secondary params (only used if primary fails)
+    params_secondary = {
+        'key': NewGPTKey.GoogleFallbackKey,
+        'cx': '4482777d3b53e4801',
+        'searchType': 'image',
+        'q': search_term,
+        'num': 10
+    }
+
+    # Expanded restricted domains
+    restricted_domains = [
+        'tiktok.com', 'instagram.com', 'facebook.com', 'fbsbx.com',  
+        'x.com', 'twitter.com', 'wikipedia.org', 'wikimedia.org',
+        'redd.it', 'reddit.com'  
+    ]
+
+    # Attempt API call with primary key
+    data = None
+    try:
+        response = requests.get(search_url, params=params_primary)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"Primary key failed with error: {e}. Trying secondary key...")
         try:
-            search_url = f"https://www.googleapis.com/customsearch/v1"
-            
-            search_term = AskQuestion
-            
-            params = {
-                'key': NewGPTKey.GoogleKey,
-                'cx': NewGPTKey.customSearchEngineID,
-                'searchType': 'image',
-                'q': search_term,
-                'num': 1
-            }
-            
-            response = requests.get(search_url, params=params)
-            
+            response = requests.get(search_url, params=params_secondary)
+            response.raise_for_status()
             data = response.json()
-            
-            linksFound = []
-            
-            linkFound = ""
-            
-            if 'items' in data:
-                for item in data['items']:
-                    linkFound = item['link']
-            
-            else:
-                await ctx.send(f"No images found in this Google Images query... ")
-            
-            
-            if "lookaside" in linkFound:
-                params1 = {
-                    'key': NewGPTKey.GoogleKey,
-                    'cx': NewGPTKey.customSearchEngineID,
-                    'searchType': 'image',
-                    'q': search_term,
-                    'num': 2
-                }
-                
-                response = requests.get(search_url, params=params1)
-                
-                data = response.json()
-                
-                if 'items' in data:
-                    for item in data['items']:
-                        linksFound.append(item['link'])
-                    
-                await ctx.send(linksFound[1])
-            
-            else:
-                await ctx.send(linkFound)
-           
-            
-        except Exception as e:
-            await ctx.send(f"Error searching and downloading images outside of initial Google Images query...: {e}")
+        except Exception as e2:
+            await ctx.send(f"Error searching images: Both API keys failed. Primary error: {e}, Secondary error: {e2}")
+            return
+
+    # Process results
+    linksFound = []
+    if 'items' in data:
+        linksFound = [item['link'] for item in data['items']]
+        print(f"Links found: {linksFound}")  # Debug print
     else:
-        await ctx.send("No search query was provided. Try asking again... ")
+        await ctx.send(f"No images found for '{search_term}'...")
+        return
+
+    # Function to check if the link is valid and compatible
+    async def is_valid_image_link(url):
+        try:
+            # Skip restricted domains
+            if any(domain in url.lower() for domain in restricted_domains):
+                print(f"Skipping restricted domain: {url}")
+                return False
+
+            head_response = requests.head(url, timeout=5, allow_redirects=True)
+            content_type = head_response.headers.get('Content-Type', '').lower()
+            content_length = int(head_response.headers.get('Content-Length', 0))
+
+            # Ensure it’s an image
+            if not content_type.startswith('image/'):
+                print(f"Invalid content type for {url}: {content_type}")
+                return False
+
+            # Check for minimum size (1KB to avoid tiny/invalid images)
+            if content_length < 1024:
+                print(f"Image too small for {url}: {content_length} bytes")
+                return False
+
+            # Validate extension
+            valid_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.apng')
+            if not url.lower().endswith(valid_extensions):
+                print(f"Invalid extension for {url}")
+                return False
+
+            # Additional check for Reddit preview links with problematic query params
+            if 'preview.redd.it' in url.lower() and ('auto=webp' in url.lower() or 'crop=smart' in url.lower()):
+                print(f"Skipping Reddit preview link with WebP conversion: {url}")
+                return False
+
+            return True
+        except requests.RequestException as e:
+            print(f"HEAD request failed for {url}: {e}")
+            return False
+
+    # Try each link in linksFound until a valid one is found
+    linkFound = None
+    for link in linksFound:
+        #DEBUG ONLY
+        print(f"Link found: {link}")
+        
+        if await is_valid_image_link(link):
+            linkFound = link
+            break
+
+    if not linkFound:
+        await ctx.send(f"No compatible images found for '{search_term}'. Try a different query...")
+        return
+
+    print(f"Selected link: {linkFound}")
+
+    # Try sending URL directly if valid
+    try:
+        head_response = requests.head(linkFound, timeout=5, allow_redirects=True)
+        content_length = int(head_response.headers.get('Content-Length', 0))
+        if content_length >= 1024:  # Ensure reasonable size
+            await ctx.send(linkFound)
+            return
+    except requests.RequestException as e:
+        print(f"HEAD request failed before sending URL {linkFound}: {e}")
+        # Fall back to downloading
+
+    # Download and validate the image
+    try:
+        image_response = requests.get(linkFound, stream=True, timeout=30)
+        image_response.raise_for_status()
+
+        content_type = image_response.headers.get('Content-Type', '').lower()
+        extension_map = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'image/bmp': '.bmp',
+            'image/apng': '.apng'
+        }
+        temp_suffix = extension_map.get(content_type, '.jpg')
+
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix) as temp_file:
+            total_bytes = 0
+            for chunk in image_response.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_file.write(chunk)
+                    total_bytes += len(chunk)
+            temp_file_path = temp_file.name
+
+        # Verify file size and integrity
+        if total_bytes < 1024:
+            os.unlink(temp_file_path)
+            await ctx.send(f"Image is too small or corrupted. Here’s the link instead: {linkFound}")
+            return
+
+        # Validate image with PIL
+        try:
+            with PilImage.open(temp_file_path) as img:
+                img.verify()  # Verify image integrity
+                img.close()
+        except Exception as e:
+            print(f"Image verification failed for {linkFound}: {e}")
+            os.unlink(temp_file_path)
+            await ctx.send(f"Image is corrupted. Here’s the link instead: {linkFound}")
+            return
+
+        # Upload to Discord
+        with open(temp_file_path, 'rb') as f:
+            image_file = discord.File(f)
+            await ctx.send(file=image_file)
+
+        os.unlink(temp_file_path)
+
+    except Exception as e:
+        print(f"Download/upload error for {linkFound}: {e}")
+        await ctx.send(f"Failed to download/upload image: {e}. Here’s the link instead: {linkFound}")
 
  
- 
-
 
 @bot.command(name='Christory', aliases = ["CHRISTORY", "christory", "Chris", "chris"])
 async def Christory(ctx):
@@ -698,6 +960,16 @@ async def AskDave(ctx, *, AskQuestion=None):
 			await ctx.send(AskList[randomPick])
                         
 
+@bot.command(name='Lodmot', aliases = ["lodmot", "lod", "game"])
+async def LodmotGame(ctx):
+    #Send Lodmot sticker first.
+    await ctx.send("https://media.discordapp.net/stickers/1197011527039979624.webp?size=320")
+    
+    #Send link to Lodmot's game.
+    await ctx.send("# **Play Lodmot's Game:**")
+    await ctx.send("https://www.megatoxic.com/the-vault/quick-shoot-series")
+
+
 @bot.command(name='Koralik', aliases = ["Adam", "adam", "koralik", "KORALIK"])
 async def KoralikVid(ctx):
 	KoralikList = []
@@ -723,18 +995,6 @@ async def JimmyCarter(ctx):
     await ctx.send("https://cdn.discordapp.com/attachments/513111374889746452/1324142010403127326/Jimmy_Carter_Gangsta.gif?ex=677712d8&is=6775c158&hm=f2192cb4e3b259a48eb63bc71a358e34253201b1658b281fd0893c0839dddb9f&")
 
 
-"""
-@bot.command(name='JimmyCarter', aliases = ["Jimmycarter", "jimmycarter", "JIMMYCARTER"])
-async def JimmyCarter(ctx):
-    await ctx.send("<:JimmyCarter:1112210411752800286>")
-    #await ctx.send("Jimmy Carter is currently: " + str(JimmyCarterBirthMinutes(1924, 10, 1)) + " minutes old")
-    await ctx.send("Jimmy Carter is currently: DEAD")
-    await ctx.send("RIP...")
-    await ctx.send("https://tenor.com/view/jimmy-carter-president-simpsons-breakdancing-performance-gif-18651748")
-    #await ctx.send("\nMore precisely, that translates to: \n")
-    #await ctx.send(JimmyCarterBirthFormatted())
-"""
-
 @bot.command(name='Dictionary', aliases = ["dictionary", "Dict", "dict", "urban", "Urban"])
 async def Dictionary(ctx):
         UrbanData = jsons.loads(requests.get("https://api.urbandictionary.com/v0/random").text)
@@ -751,8 +1011,7 @@ async def Dictionary(ctx):
 
         await ctx.send(WordDef)
         
-        
-        
+               
 @bot.command(name = "What", aliases = ["WHAT", "what", "wat", "Wat"])
 async def allCapRepeat(ctx):
 
@@ -787,9 +1046,9 @@ async def on_message(message):
 
 
     """
-    Fahrenheit = None
-    Celsius = None
-    Kelvin = None
+    Fahrenheit
+    Celsius
+    Kelvin 
     """
 
     try:
@@ -1075,25 +1334,119 @@ async def Weather(ctx, *, Question = None):
 		await ctx.send(f"No question asked. Try again... ")
 
 
-@bot.command(name= "Pluto", aliases = ["pluto", "Sega", "sega"])
-async def PlutoPhotos(ctx):
+def compute_similarities(query, plutoImages):
+    """Compute similarities between the query and precomputed tag embeddings."""
+    embedder = SentenceTransformer('all-MiniLM-L12-v2')
+    queryLower = unicodedata.normalize('NFC', unicodedata.normalize('NFKD', query.lower().strip()))
+    queryEmbedding = embedder.encode(queryLower, convert_to_tensor=True)
 
-    plutoPhotoPath = "PlutoPhotos"
-    plutoImages = [file for file in os.listdir(plutoPhotoPath) if file.endswith(("jpg", "jpeg", "png"))]
+    similarities = {}
+    for filename in tag_embeddings_cache:
+        if filename not in plutoImages:
+            continue
+        tagEmbedding = tag_embeddings_cache[filename]
+        similarity = util.cos_sim(queryEmbedding, tagEmbedding).item()
+        tags = photo_tags_cache[filename].get("tags", [])
+        similarities[filename] = (similarity, tags)
+    return similarities
+    
 
-    #check if PlutoImages folder is empty
+@bot.command(name="Pluto", aliases=["pluto", "Sega", "sega"])
+async def PlutoPhotos(ctx, *, query=None):
+    # Setup paths using the user's home directory
+    home_dir = os.path.expanduser("~")
+    plutoPhotoPath = os.path.join(home_dir, "PlutoPhotos")
+    jsonPath = os.path.join(plutoPhotoPath, "photoTags.json")
+
+    # Use global plutoImages from on_ready
     if not plutoImages:
         await ctx.send("No images found in the PlutoPhotos folder... ")
-    
-    else:
+        return
+
+    if not os.path.exists(jsonPath):
+        await ctx.send("The photo tags file (photoTags.json) is missing. Please run the tagging script first.")
+        return
+
+    if not photo_tags_cache:
+        await ctx.send("No tagged photos found in photoTags.json. Please restart the bot to load tags.")
+        return
+
+    # If no query, return a random photo
+    if not query or query.strip() == "":
         randomPlutoPhoto = random.choice(plutoImages)
-        
         randomPlutoPhotoPath = os.path.join(plutoPhotoPath, randomPlutoPhoto)
-        
-        with open(randomPlutoPhotoPath, "rb") as plutoPhotoOpen:
-            sendPlutoPhoto = discord.File(plutoPhotoOpen)
-            
+        with open(randomPlutoPhotoPath, "rb") as pf:
+            sendPlutoPhoto = discord.File(pf)
             await ctx.send(file=sendPlutoPhoto)
+        return
+
+    # Normalize query and split into parts
+    query_lower = query.lower().strip()
+    query_parts = re.split(r'\s+', query_lower)
+
+    # Exact tag matching (no substrings)
+    substring_scores = {}
+    for filename in plutoImages:
+        if filename not in photo_tags_cache:
+            continue
+        tags_lower = [tag.lower() for tag in photo_tags_cache[filename].get("tags", [])]
+        score = 0
+        # Check if full query matches a tag exactly
+        if query_lower in tags_lower:  # Exact match of full query
+            score += tag_weights.get(query_lower, 1.0) * 2  # Double weight for full match
+        # Check individual tags against query parts (exact matches only)
+        for tag in tags_lower:
+            if tag == query_lower:  # Already counted above, skip here
+                continue
+            if tag in query_parts:  # Exact match of tag to a query part
+                score += tag_weights.get(tag, 1.0)
+        # Boost for matching multiple query parts exactly
+        matched_parts = sum(1 for part in query_parts if part in tags_lower)  # Exact matches only
+        score += matched_parts * 2  # Extra weight for multi-part matches
+        if score > 0:
+            substring_scores[filename] = score
+
+    # If exact matches exist, pick the best one
+    if substring_scores:
+        best_match = max(substring_scores.items(), key=lambda x: x[1])[0]
+        best_photo_path = os.path.join(plutoPhotoPath, best_match)
+        with open(best_photo_path, "rb") as pf:
+            send_photo = discord.File(pf)
+            await ctx.send(file=send_photo)
+        return
+
+    # Fallback to cosine similarity
+    try:
+        similarities = await asyncio.to_thread(compute_similarities, query, plutoImages)
+    except Exception as e:
+        await ctx.send("An error occurred while computing similarities. Please try again later.")
+        print(f"Error in compute_similarities: {e}")
+        return
+
+    if not similarities:
+        randomPlutoPhoto = random.choice(plutoImages)
+        randomPlutoPhotoPath = os.path.join(plutoPhotoPath, randomPlutoPhoto)
+        with open(randomPlutoPhotoPath, "rb") as pf:
+            sendPlutoPhoto = discord.File(pf)
+            await ctx.send("No decent matches, here’s a random photo instead:", file=sendPlutoPhoto)
+        return
+
+    # Find best match with lowered threshold
+    best_match = max(similarities.items(), key=lambda x: x[1][0])
+    best_photo, (similarity_score, matched_tags) = best_match
+    if similarity_score < 0.2:  # Threshold at 0.2 as requested
+        randomPlutoPhoto = random.choice(plutoImages)
+        randomPlutoPhotoPath = os.path.join(plutoPhotoPath, randomPlutoPhoto)
+        with open(randomPlutoPhotoPath, "rb") as pf:
+            sendPlutoPhoto = discord.File(pf)
+            await ctx.send("No decent matches, here’s a random photo instead:", file=sendPlutoPhoto)
+        return
+
+    # Send the best matching photo if above threshold
+    best_photo_path = os.path.join(plutoPhotoPath, best_photo)
+    with open(best_photo_path, "rb") as pf:
+        send_photo = discord.File(pf)
+        await ctx.send(file=send_photo)
             
 
 @bot.command(name= "AtGames", aliases = ["atgames", "ATGAMES"])
@@ -1197,61 +1550,195 @@ async def Currency(ctx, *, currencyQuestion=None):
 """
 
 
-@bot.command(name= "describe", aliases = ["Describe", "DESCRIBE"])
-async def DaveDescribe(ctx, *, Question = None):
+@bot.command(name="describe", aliases=["Describe", "DESCRIBE"])
+async def DaveDescribe(ctx, *, Question=None):
     if Question:
         PromptQuestion = str(Question)
-        
     else:
-        PromptQuestion = "Describe the following image as vividly and in as much detail as possible."
-        
+        PromptQuestion = "Describe the following image as vividly and in as much detail as possible. Also do so in a smug and insulting manner."
+
     if not ctx.message.reference:
         await ctx.send("Please reply to a message containing an image with the `!describe` command...")
         return
-        
-    refMessage = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-    
-    #Check for attachments in image you're replying to
-    if not refMessage.attachments:
-        await ctx.send("No images found in the message you're replying to. Try again...")
-        return
-    
-    #Process and describe the first image replied to if there are multiple
-    attachedImage = refMessage.attachments[0]
-    
-    if not attachedImage.content_type.startswith("image"):
+
+    referencedMessage = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+
+    # Regex patterns for embedded images
+    embeddedImageRegex = r'(https?://\S+\.(?:png|jpg|jpeg|gif|webp|bmp)\S*)|(https?://images-ext-\d+\.discordapp\.net/external/\S+)'
+    embeddedURL = None
+    imageFilename = ""
+
+    # Check for attached image first
+    if referencedMessage.attachments:
+        attachedImage = referencedMessage.attachments[0]
+        if attachedImage.content_type.startswith("image"):
+            embeddedURL = attachedImage.url
+            imageFilename = attachedImage.filename
+
+    # Check for embedded URL next
+    elif referencedMessage.content:
+        match = re.search(embeddedImageRegex, referencedMessage.content)
+        print(f"Match is: {match}")
+        if match:
+            embeddedURL = match.group(0)
+
+    if not embeddedURL:
         await ctx.send("A valid image wasn't found. Try again with a different image...")
         return
-    
-    #Download the image to memory for processing
-    daveResponse = requests.get(attachedImage.url)
-    
-    #attachedImage.url
-    print(f"Attached image URL: {attachedImage.url}")
-    print()
-    
-    daveResponse = client.chat.completions.create(
-      model="gpt-4o-mini",
-      messages=[
-        {
-          "role": "user",
-          "content": [
-            {"type": "text", "text": PromptQuestion},
-            {
-              "type": "image_url",
-              "image_url": {
-                "url": attachedImage.url,
-              },
-            },
-          ],
-        }
-      ],
-      max_tokens=100,
-    )
 
-    #Extract the description for the image
-    responseDescription = daveResponse.choices[0].message.content.strip()
-    await ctx.send(f"{responseDescription}")
+    print(f"Embedded URL is: {embeddedURL}")
+    print(f"Image filename: {imageFilename}")
+
+    # Download the image to memory for attachment processing
+    try:
+        daveResponse = requests.get(embeddedURL, stream=True)
+        daveResponse.raise_for_status()
+
+        if imageFilename != "":
+            tempImagePath = f"/tmp/tempImage_{imageFilename}"
+        else:
+            tempImagePath = f"/tmp/tempImage_{embeddedURL.split('.')[-1].split('?')[0]}"
+
+        with open(tempImagePath, "wb") as w:
+            for chunk in daveResponse.iter_content(1024):
+                w.write(chunk)
+
+        # Try to find the original image in PlutoPhotos for EXIF data
+        locationData = None
+        if imageFilename != "":
+            plutoPhotosFolder = "/home/Dan/PlutoPhotos"
+            # Normalize filename for matching (case-insensitive, remove prefix)
+            originalFilename = imageFilename.replace("PlutoPhotos_", "", 1).lower()
+            print(f"Looking for original filename: {originalFilename} in {plutoPhotosFolder}")
+
+            # List all files in PlutoPhotos and log them for debugging
+            plutoFiles = os.listdir(plutoPhotosFolder)
+            print(f"Files in {plutoPhotosFolder}: {plutoFiles}")
+
+            # Find a case-insensitive match
+            matchingFile = None
+            for f in plutoFiles:
+                if f.lower() == originalFilename and f.lower().endswith((".jpg", ".jpeg", ".png")):
+                    matchingFile = f
+                    break
+
+            if matchingFile:
+                originalImagePath = os.path.join(plutoPhotosFolder, matchingFile)
+                print(f"Found matching file: {originalImagePath}")
+                locationData = extractExifLocation(originalImagePath)
+                print(f"Location from original image: {locationData}")
+            else:
+                # Try fuzzy matching as a fallback
+                from fuzzywuzzy import fuzz
+                best_ratio = 0
+                for f in plutoFiles:
+                    if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                        ratio = fuzz.ratio(f.lower(), originalFilename)
+                        print(f"Comparing {f.lower()} with {originalFilename}: ratio {ratio}")
+                        if ratio > best_ratio and ratio > 90:  # Threshold for a good match
+                            best_ratio = ratio
+                            matchingFile = f
+
+                if matchingFile:
+                    originalImagePath = os.path.join(plutoPhotosFolder, matchingFile)
+                    print(f"Found matching file (fuzzy match, ratio {best_ratio}): {originalImagePath}")
+                    locationData = extractExifLocation(originalImagePath)
+                    print(f"Location from original image: {locationData}")
+                else:
+                    print(f"No matching file found for {originalFilename} in {plutoPhotosFolder}")
+                    print(f"Image not found in PlutoPhotos folder. EXIF data unavailable. Falling back to visual description.")
+        else:
+            print("No filename provided (likely an embedded URL). EXIF data unavailable. Falling back to visual description.")
+
+        # Add location data to the prompt if available
+        if locationData:
+            PromptQuestion += f" The Sega Pluto prototype showcased in this image was photographed at the following location: {locationData}. Use it to provide location but don’t display the coordinates in the final result."
+
+        # Call GPT to describe the image
+        daveResponse = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": PromptQuestion},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": embeddedURL,
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=150,
+        )
+
+        # Extract the description for the image
+        responseDescription = daveResponse.choices[0].message.content.strip()
+        await ctx.send(f"{responseDescription}")
+
+        # Clean up the temporary file
+        os.remove(tempImagePath)
+
+    except Exception as e:
+        print(f"Error processing image: {e}")
+        await ctx.send(f"Something went wrong with processing the image... ")
+    
+    
+def extractExifLocation(imagePath):
+    try:
+        image = PilImage.open(imagePath)
+        exifExtract = image._getexif()
+        if not exifExtract:
+            print(f"No EXIF data found in {imagePath}")
+            return None
+
+        gpsInfo = {}
+        for tag, value in exifExtract.items():
+            tagName = TAGS.get(tag, tag)
+            if tagName == "GPSInfo":
+                gpsInfo = {GPSTAGS.get(k, k): v for k, v in value.items()}
+                print(f"Raw GPSInfo for {imagePath}: {gpsInfo}")  # Debug raw GPS data
+
+        if "GPSLatitude" not in gpsInfo or "GPSLongitude" not in gpsInfo:
+            print(f"No GPS data found in EXIF for {imagePath}: {gpsInfo}")
+            return None
+
+        lat = gpsInfo["GPSLatitude"]
+        lon = gpsInfo["GPSLongitude"]
+        latRef = gpsInfo.get("GPSLatitudeRef", "N")
+        lonRef = gpsInfo.get("GPSLongitudeRef", "E")
+
+        # Handle decimal degrees (float or int) or DMS (tuple/list)
+        if isinstance(lat, (tuple, list)):
+            lat = convertToDegrees(lat, latRef)
+        else:
+            lat = float(lat)
+            if latRef == "S":
+                lat = -lat
+
+        if isinstance(lon, (tuple, list)):
+            lon = convertToDegrees(lon, lonRef)
+        else:
+            lon = float(lon)
+            if lonRef == "W":
+                lon = -lon
+
+        print(f"Extracted coordinates from {imagePath}: Latitude {lat}, Longitude {lon}")
+        return f"Latitude: {lat}, Longitude: {lon}"
+    except Exception as e:
+        print(f"Error extracting EXIF from {imagePath}: {e}")
+        return None
+        
+
+def convertToDegrees(value, ref):
+    # Convert coordinates from EXIF DMS to decimal degrees
+    d, m, s = value
+    degrees = d + (m / 60.0) + (s / 3600.0)
+    if ref in ["S", "W"]:
+        degrees = -degrees
+    return degrees
     
 
 @bot.command(name= "DaveGPT", aliases = ["Davegpt", "daveGPT", "davegpt"])
@@ -1293,7 +1780,7 @@ async def DaveGPT(ctx, *, Question = None):
             retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
             
             
-            #gpt-4o-mini-2024-07-18
+            #Model used: gpt-4o-mini-2024-07-18
             llm = ChatOpenAI(model_name = "gpt-4o-mini-2024-07-18", temperature = 0.9)
 
             def format_docs(TxtDoc):
